@@ -1,0 +1,11 @@
+gspread
+oauth2client
+openai
+python-dotenv
+certifi
+charset-normalizer
+idna
+requests
+urllib3
+thefuzz
+python-Levenshtein
