@@ -8,7 +8,7 @@ from oauth2client.service_account import ServiceAccountCredentials
 SPREADSHEET_ID = '1aX1yUvj2kJFv331P9P2xgzdVwD2Miadb47wEJVMI4TQ'
 SHEET_NAME = 'Articulos publicados Reventa'
 AUX_SHEET_NAME = 'Auxiliar'
-PRODUCTS_JSON_PATH = 'stock_summary.json'
+VARIANT_SUMMARY_JSON_PATH = 'stock_summary.json'
 
 # === AUTHENTICATION & DATA LOADING ===
 def authenticate_gspread():
@@ -34,32 +34,22 @@ def load_sheet_data(client, spreadsheet_id, sheet_name):
         print(f"❌ Falló la carga de datos de la hoja: {e}")
         exit()
 
-def load_local_products(json_path):
+def load_local_variant_summary(json_path):
     try:
         with open(json_path, 'r', encoding='utf-8') as f:
             return json.load(f)
     except Exception as e:
-        print(f"❌ Falló la carga del archivo de productos JSON: {e}")
+        print(f"❌ Falló la carga del archivo de resumen de variantes JSON: {e}")
         exit()
 
 # === DATA PROCESSING HELPERS ===
 def find_column_index(headers, column_title):
-    import re
     normalized_column_title = re.sub(r'[^a-z0-9]', '', column_title.lower())
     for i, header in enumerate(headers):
         normalized_header = re.sub(r'[^a-z0-9]', '', header.lower())
         if normalized_column_title == normalized_header:
             return i
     raise ValueError(f"No se pudo encontrar la columna: {column_title}")
-
-def extract_storage_capacity(model_string):
-    match = re.search(r'(?:MEM|DD):(\d+(?:GB|TB))', model_string, re.IGNORECASE)
-    if match:
-        return match.group(1)
-    match = re.search(r'(\d+\s*GB|\d+\s*TB)', model_string, re.IGNORECASE)
-    if match:
-        return match.group(1).replace(" ", "")
-    return ""
 
 def col_to_letter(col_idx):
     letter = ''
@@ -70,7 +60,7 @@ def col_to_letter(col_idx):
         temp_idx -= 1
     return letter
 
-# === NEW CLEANUP & AUX SHEET LOGIC ===
+# === CLEANUP, AUX & FORMATTING FUNCTIONS ===
 def clean_column_brackets(sheet, column_index):
     col_letter = col_to_letter(column_index)
     print(f"🧼 Limpiando datos antiguos con corchetes en la columna {col_letter}...")
@@ -94,19 +84,18 @@ def clean_column_brackets(sheet, column_index):
     else:
         print("-> No se encontraron datos con corchetes para limpiar.")
 
-def update_aux_sheet(spreadsheet, aux_sheet_name, products_by_model):
+def update_aux_sheet(spreadsheet, aux_sheet_name, local_variant_summary):
     print(f"📋 Actualizando la hoja '{aux_sheet_name}' con opciones de variantes...")
     vp_options, vs_options, vt_options = set(), set(), set()
-    for model, product_list in products_by_model.items():
-        for product in product_list:
-            familia = product.get("Familia", "").upper()
-            if "CELULARES" in familia:
-                vp_options.add(extract_storage_capacity(model))
-                vs_options.add(product.get("Color", "").strip())
-                vt_options.add(product.get("Compañía", "").strip())
-            elif "CONSOLAS" in familia:
-                vp_options.add(extract_storage_capacity(model))
-                vs_options.add("c-caja" if product.get("Con Caja") else "s-caja") # Use new format
+    for variant in local_variant_summary:
+        familia = variant.get("familia", "").upper()
+        if "CELULARES" in familia:
+            vp_options.add(variant.get("storage", ""))
+            vs_options.add(variant.get("color", "").strip())
+            vt_options.add(variant.get("compania", "").strip())
+        elif "CONSOLAS" in familia:
+            vp_options.add(variant.get("storage", ""))
+            vs_options.add(variant.get("caja", ""))
     try:
         aux_sheet = spreadsheet.worksheet(aux_sheet_name)
         aux_sheet.batch_clear(['E:G'])
@@ -122,7 +111,6 @@ def update_aux_sheet(spreadsheet, aux_sheet_name, products_by_model):
     aux_sheet.update(values=data_to_write, range_name='E1', value_input_option='USER_ENTERED')
     print(f"✅ Hoja '{aux_sheet_name}' actualizada.")
 
-# === FORMATTING ===
 def apply_data_validation_rule(spreadsheet, sheet, column_index, end_row, rule_dict, column_name):
     print(f"🎨 Aplicando regla de validación a la columna '{column_name}'...")
     try:
@@ -131,6 +119,55 @@ def apply_data_validation_rule(spreadsheet, sheet, column_index, end_row, rule_d
         print(f"✅ Regla de validación aplicada a '{column_name}'.")
     except Exception as e:
         print(f"⚠️ No se pudo aplicar la regla de validación a '{column_name}'. Error: {e}")
+
+def apply_chip_style_from_template(spreadsheet, sheet, column_index, end_row, template_cell_a1, column_name):
+    """Copies the data validation from a template cell to a whole column."""
+    print(f"🎨 Aplicando estilo de validación 'chip' a la columna '{column_name}' desde la plantilla '{template_cell_a1}'...")
+    try:
+        match = re.match(r"([A-Z]+)([0-9]+)", template_cell_a1.upper())
+        if not match:
+            raise ValueError(f"Formato de celda de plantilla no válido: {template_cell_a1}")
+        
+        col_str, row_str = match.groups()
+        
+        col_idx = 0
+        for char in col_str:
+            col_idx = col_idx * 26 + (ord(char) - ord('A') + 1)
+        col_idx = col_idx - 1
+
+        row_idx = int(row_str) - 1
+
+        source_range = {
+            "sheetId": sheet.id,
+            "startRowIndex": row_idx,
+            "endRowIndex": row_idx + 1,
+            "startColumnIndex": col_idx,
+            "endColumnIndex": col_idx + 1,
+        }
+        
+        destination_range = {
+            "sheetId": sheet.id,
+            "startRowIndex": 2,
+            "endRowIndex": end_row,
+            "startColumnIndex": column_index,
+            "endColumnIndex": column_index + 1,
+        }
+
+        request = {
+            "copyPaste": {
+                "source": source_range,
+                "destination": destination_range,
+                "pasteType": "PASTE_DATA_VALIDATION",
+                "pasteOrientation": "NORMAL"
+            }
+        }
+        
+        spreadsheet.batch_update({"requests": [request]})
+        print(f"✅ Estilo de validación 'chip' aplicado a '{column_name}'.")
+
+    except Exception as e:
+        print(f"⚠️ No se pudo aplicar el estilo de validación 'chip' a '{column_name}'. Error: {e}")
+
 
 def apply_cell_format(spreadsheet, sheet, column_index, end_row, format_payload, column_name):
     print(f"🎨 Aplicando formato de celda a la columna '{column_name}'...")
@@ -144,70 +181,34 @@ def apply_cell_format(spreadsheet, sheet, column_index, end_row, format_payload,
         print(f"⚠️ No se pudo aplicar el formato de celda a '{column_name}'. Error: {e}")
 
 # === CORE LOGIC ===
-def aggregate_local_stock(products_by_model):
-    print("📦 Agregando el stock local por variante única...")
-    local_variants = defaultdict(lambda: {"count": 0, "data": {}})
-    # Colores comunes a ignorar para celulares, en formato capitalizado.
-    colores_comunes = {"Azul", "Negro", "Blanco"}
-
-    for model, product_list in products_by_model.items():
-        for product in product_list:
-            familia = product.get("Familia", "").upper()
-            storage = extract_storage_capacity(model)
-            color = product.get("Color", "").strip()
-            carrier = product.get("Compañía", "").strip()
-            box_status = "c-caja" if product.get("Con Caja") else "s-caja"  # Use new format
-
-            # --- Lógica de exclusión de colores para celulares ---
-            if "CELULARES" in familia:
-                # Si el color no está especificado, no se puede procesar la variante.
-                if not color:
-                    continue
-                # Si el color está en la lista de colores comunes, se ignora el producto.
-                if color in colores_comunes:
-                    continue
-            # ----------------------------------------------------
-
-            variant_key, variant_data = None, {}
-            if "CELULARES" in familia:
-                variant_key = f"{model.lower()}::{storage.lower()}::{color.lower()}::{carrier.lower()}"
-                variant_data = {"vp": storage, "vs": color, "vt": carrier, "familia": familia}
-            elif "CONSOLAS" in familia:
-                variant_key = f"{model.lower()}::{storage.lower()}::{box_status.lower()}"
-                variant_data = {"vp": storage, "vs": box_status, "vt": "", "familia": familia}
-            
-            if variant_key:
-                local_variants[variant_key]["count"] += 1
-                if not local_variants[variant_key]["data"]:
-                    local_variants[variant_key]["data"] = variant_data
-                    local_variants[variant_key]["data"]["model"] = model
-                    local_variants[variant_key]["data"]["color"] = color
-                    
-    print(f"-> Se encontraron {len(local_variants)} variantes únicas en los archivos locales (filtrando colores comunes).")
-    return local_variants
-
 def map_sheet_variants(rows, headers, indices):
     print("📊 Mapeando variantes existentes en la hoja de Google...")
-    sheet_variants, models_in_sheet = {}, set()
+    sheet_variants = {}
     for i, row in enumerate(rows, start=3):
         try:
-            model, familia = row[indices["model"]].strip(), row[indices["familia"]].strip().upper()
-            vp = row[indices["vp"]].strip().replace("[", "").replace("]", "")
-            vs, vt = row[indices["vs"]].strip(), row[indices["vt"]].strip()
+            model = row[indices["model"]].strip()
+            familia = row[indices["familia"]].strip().upper()
+            vp = row[indices["vp"]].strip()
+            vs = row[indices["vs"]].strip()
+            vt = row[indices["vt"]].strip()
             if not model: continue
-            models_in_sheet.add(model)
+            
             variant_key = None
-            if "CELULARES" in familia: variant_key = f"{model.lower()}::{vp.lower()}::{vs.lower()}::{vt.lower()}"
-            elif "CONSOLAS" in familia: variant_key = f"{model.lower()}::{vp.lower()}::{vs.lower()}"
+            if "CELULARES" in familia:
+                variant_key = f"{model.lower()}::{vp.lower()}::{vs.lower()}::{vt.lower()}"
+            elif "CONSOLAS" in familia:
+                color_from_sheet = row[indices["color_col"]].strip()
+                variant_key = f"{model.lower()}::{vp.lower()}::{vs.lower()}::{color_from_sheet.lower()}"
+
             if variant_key: sheet_variants[variant_key] = i
-        except IndexError: continue
+        except IndexError: 
+            continue
     print(f"-> Se mapearon {len(sheet_variants)} variantes de la hoja de Google.")
-    return sheet_variants, models_in_sheet
+    return sheet_variants
 
 def main():
     client = authenticate_gspread()
     spreadsheet = client.open_by_key(SPREADSHEET_ID)
-    
     sheet = spreadsheet.worksheet(SHEET_NAME)
     all_values = sheet.get_all_values()
     headers = all_values[1] if len(all_values) > 1 else []
@@ -219,80 +220,152 @@ def main():
             "vs": find_column_index(headers, "Variante Secundaria"), "vt": find_column_index(headers, "Variante Terciaria"),
             "principal_extra": find_column_index(headers, "¿Principal o Extra?"), "cert": find_column_index(headers, "¿Certificado?"),
             "pub_exitosa": find_column_index(headers, "¿Publicación exitosa?"), "tiene_ventas": find_column_index(headers, "Tiene ventas?"),
-            "ads_primaria": find_column_index(headers, "Pagamos Ads? (primaria)"), "ads_secundaria": find_column_index(headers, "Pagamos Ads? (secundaria)")
+            "ads_primaria": find_column_index(headers, "Pagamos Ads? (primaria)"), "ads_secundaria": find_column_index(headers, "Pagamos Ads? (secundaria)"),
+            "color_col": find_column_index(headers, "Color")
         }
+        try:
+            indices["caja"] = find_column_index(headers, "¿Caja?")
+        except ValueError:
+            print("⚠️ No se encontró la columna '¿Caja?'. Se omitirá.")
+        try:
+            indices["clase"] = find_column_index(headers, "Clase")
+        except ValueError:
+            print("⚠️ No se encontró la columna 'Clase'. Se omitirá.")
+        try:
+            indices["quien_publica"] = find_column_index(headers, "Quien publica?")
+        except ValueError:
+            print("⚠️ No se encontró la columna 'Quien publica?'. Se omitirá.")
+
         inventory_col_letter = col_to_letter(indices["inventory"])
     except ValueError as e:
         print(f"❌ Error crítico: {e}. Revisa los nombres de las columnas en tu hoja."); exit()
 
-    # Clean up old bracketed data before any processing
     clean_column_brackets(sheet, indices["vp"])
-    # We need to re-read the data after cleaning it
     rows = sheet.get_all_values()[2:] if len(sheet.get_all_values()) > 2 else []
 
-    local_products_by_model = load_local_products(PRODUCTS_JSON_PATH)
-    update_aux_sheet(spreadsheet, AUX_SHEET_NAME, local_products_by_model)
+    # --- NEW: Pre-process to find models marked as 'Principal' ---
+    principal_models = set()
+    print("🔍 Identificando modelos 'Principales' en la hoja...")
+    for row in rows:
+        try:
+            if row[indices["principal_extra"]].strip().lower() == 'principal':
+                principal_models.add(row[indices["model"]].strip())
+        except IndexError:
+            continue
+    print(f"-> {len(principal_models)} modelos marcados como 'Principal' encontrados.")
+    # ---------------------------------------------------------
 
-    local_variants = aggregate_local_stock(local_products_by_model)
-    sheet_variants_map, models_in_sheet = map_sheet_variants(rows, headers, indices)
+    local_variant_summary = load_local_variant_summary(VARIANT_SUMMARY_JSON_PATH)
+    update_aux_sheet(spreadsheet, AUX_SHEET_NAME, local_variant_summary)
+
+    sheet_variants_map = map_sheet_variants(rows, headers, indices)
+    local_variants_map = {}
 
     batch_updates, rows_to_append = [], []
-    print("\n🔄 Sincronizando datos locales con la hoja de Google...")
+    print("\n🔄 Sincronizando el resumen de stock local con la hoja de Google...")
 
-    for key, local_data in local_variants.items():
-        stock_count, variant_details = local_data["count"], local_data["data"]
+    for variant in local_variant_summary:
+        model_original = variant.get("model_original", "")
+
+        # --- NEW: 'Principal' Filter Logic ---
+        if model_original not in principal_models:
+            continue
+        # ------------------------------------
+
+        familia = variant.get("familia", "").upper()
+        storage = variant.get("storage", "")
+        color = variant.get("color", "")
+        compania = variant.get("compania", "")
+        caja = variant.get("caja", "")
+
+        key = None
+        variant_details_for_new_row = {}
+        if "CELULARES" in familia:
+            key = f"{model_original.lower()}::{storage.lower()}::{color.lower()}::{compania.lower()}"
+            variant_details_for_new_row = {"model": model_original, "familia": familia, "vp": storage, "vs": color, "vt": compania}
+        elif "CONSOLAS" in familia:
+            # Key for consoles includes model, storage (vp), caja (vs), and color (from the 'color' field in the variant)
+            key = f"{model_original.lower()}::{storage.lower()}::{caja.lower()}::{color.lower()}"
+            # For new rows, vp is storage, vs is caja, vt is empty, and 'Color' column is populated with variant['color']
+            variant_details_for_new_row = {"model": model_original, "familia": familia, "vp": storage, "vs": caja, "vt": "", "color_col": color}
+        
+        if not key: continue
+        
+        local_variants_map[key] = variant["stock"]
+
         if key in sheet_variants_map:
             row_index = sheet_variants_map[key]
-            batch_updates.append({"range": f"{inventory_col_letter}{row_index}", "values": [[stock_count]]})
+            batch_updates.append({'range': f'{inventory_col_letter}{row_index}', 'values': [[variant["stock"]]]})
         else:
-            if variant_details["model"] in models_in_sheet:
-                new_row = [''] * len(headers)
-                new_row[indices["model"]] = variant_details["model"]
-                new_row[indices["familia"]] = variant_details["familia"]
-                new_row[indices["vp"]] = variant_details["vp"]
-                new_row[indices["vs"]] = variant_details["vs"]
-                new_row[indices["vt"]] = variant_details["vt"]
-                new_row[indices["inventory"]] = stock_count
-                new_row[indices["cert"]] = "FALSE"
-                new_row[indices["pub_exitosa"]] = "FALSE"
-                new_row[indices["tiene_ventas"]] = "FALSE"
-                new_row[indices["principal_extra"]] = "Extra"
-                rows_to_append.append(new_row)
+            new_row = [''] * len(headers)
+            for col_name, index in indices.items():
+                if col_name in variant_details_for_new_row:
+                    new_row[index] = variant_details_for_new_row[col_name]
+                elif col_name == "inventory":
+                    new_row[index] = variant["stock"]
+                elif col_name == "color_col" and "color_col" in variant_details_for_new_row: # Handle color_col specifically
+                    new_row[index] = variant_details_for_new_row["color_col"]
+            # Set default values for boolean-like columns for new rows
+            new_row[indices["cert"]] = "FALSE"
+            new_row[indices["pub_exitosa"]] = "FALSE"
+            new_row[indices["tiene_ventas"]] = "FALSE"
+            new_row[indices["principal_extra"]] = "Extra"
+            rows_to_append.append(new_row)
 
-    variants_to_zero_out = set(sheet_variants_map.keys()) - set(local_variants.keys())
+    variants_to_zero_out = set(sheet_variants_map.keys()) - set(local_variants_map.keys())
     if variants_to_zero_out:
-        print(f"🧹 Se encontraron {len(variants_to_zero_out)} variantes para poner en cero.")
+        print(f"🧹 Se encontraron {len(variants_to_zero_out)} variantes en la hoja que no existen localmente. Poniendo su stock a 0...")
         for key in variants_to_zero_out:
             row_index = sheet_variants_map[key]
-            batch_updates.append({"range": f"{inventory_col_letter}{row_index}", "values": [[0]]})
+            batch_updates.append({'range': f'{inventory_col_letter}{row_index}', 'values': [[0]]})
 
-    if batch_updates: sheet.batch_update(batch_updates)
-    if rows_to_append: 
+    if batch_updates:
+        print(f"-> Actualizando {len(batch_updates)} filas existentes...")
+        sheet.batch_update(batch_updates)
+    
+    if rows_to_append:
+        print(f"-> Añadiendo {len(rows_to_append)} nuevas filas...")
         sheet.append_rows(rows_to_append, value_input_option='USER_ENTERED')
-        sheet.sort((indices["model"] + 1, 'asc'), range=f'A3:Z{sheet.row_count}')
+        # FIX: Use the actual column count for the sort range to avoid issues with columns beyond Z
+        last_col_letter = col_to_letter(sheet.col_count - 1)
+        print(f"-> Ordenando hasta la columna {last_col_letter}...")
+        sheet.sort((indices["model"] + 1, 'asc'), range=f'A3:{last_col_letter}{sheet.row_count}')
 
-    # --- Final Formatting ---
+    # --- Final Formatting Calls ---
     final_row_count = len(sheet.get_all_values())
     checkbox_rule = {"condition": {"type": "BOOLEAN"}, "strict": True, "showCustomUi": True}
-    dropdown_principal_rule = {"condition": {"type": "ONE_OF_LIST", "values": [{"userEnteredValue": v} for v in ["Principal", "Extra"]]}, "strict": False}
-    dropdown_ads_rule = {"condition": {"type": "ONE_OF_LIST", "values": [{"userEnteredValue": v} for v in ["Si", "No"]]}, "strict": False}
+    
+    apply_data_validation_rule(spreadsheet, sheet, indices["cert"], final_row_count, checkbox_rule, "¿Certificado?")
+    apply_data_validation_rule(spreadsheet, sheet, indices["pub_exitosa"], final_row_count, checkbox_rule, "¿Publicación exitosa?")
+    apply_data_validation_rule(spreadsheet, sheet, indices["tiene_ventas"], final_row_count, checkbox_rule, "Tiene ventas?")
+
+    apply_chip_style_from_template(spreadsheet, sheet, indices["principal_extra"], final_row_count, 'L3', "¿Principal o Extra?")
+    apply_chip_style_from_template(spreadsheet, sheet, indices["ads_primaria"], final_row_count, 'Q3', "Pagamos Ads? (primaria)")
+    apply_chip_style_from_template(spreadsheet, sheet, indices["ads_secundaria"], final_row_count, 'R3', "Pagamos Ads? (secundaria)")
+    if "caja" in indices:
+        apply_chip_style_from_template(spreadsheet, sheet, indices["caja"], final_row_count, 'S3', "¿Caja?")
+    if "clase" in indices:
+        apply_chip_style_from_template(spreadsheet, sheet, indices["clase"], final_row_count, 'W3', "Clase")
+    if "quien_publica" in indices:
+        apply_chip_style_from_template(spreadsheet, sheet, indices["quien_publica"], final_row_count, 'X3', "Quien publica?")
+    if "familia" in indices:
+        apply_chip_style_from_template(spreadsheet, sheet, indices["familia"], final_row_count, 'AA3', "Familia")
+
     dropdown_vp_rule = {"condition": {"type": "ONE_OF_RANGE", "values": [{"userEnteredValue": f"={AUX_SHEET_NAME}!E2:E"}]}, "strict": False}
     dropdown_vs_rule = {"condition": {"type": "ONE_OF_RANGE", "values": [{"userEnteredValue": f"={AUX_SHEET_NAME}!F2:F"}]}, "strict": False}
     dropdown_vt_rule = {"condition": {"type": "ONE_OF_RANGE", "values": [{"userEnteredValue": f"={AUX_SHEET_NAME}!G2:G"}]}, "strict": False}
     vp_cell_format = {"horizontalAlignment": "CENTER", "textFormat": {"fontSize": 10}}
 
-    apply_data_validation_rule(spreadsheet, sheet, indices["cert"], final_row_count, checkbox_rule, "¿Certificado?")
-    apply_data_validation_rule(spreadsheet, sheet, indices["pub_exitosa"], final_row_count, checkbox_rule, "¿Publicación exitosa?")
-    apply_data_validation_rule(spreadsheet, sheet, indices["tiene_ventas"], final_row_count, checkbox_rule, "Tiene ventas?")
-    apply_data_validation_rule(spreadsheet, sheet, indices["principal_extra"], final_row_count, dropdown_principal_rule, "¿Principal o Extra?")
-    apply_data_validation_rule(spreadsheet, sheet, indices["ads_primaria"], final_row_count, dropdown_ads_rule, "Pagamos Ads? (primaria)")
-    apply_data_validation_rule(spreadsheet, sheet, indices["ads_secundaria"], final_row_count, dropdown_ads_rule, "Pagamos Ads? (secundaria)")
     apply_data_validation_rule(spreadsheet, sheet, indices["vp"], final_row_count, dropdown_vp_rule, "Variante Primaria")
     apply_data_validation_rule(spreadsheet, sheet, indices["vs"], final_row_count, dropdown_vs_rule, "Variante Secundaria")
     apply_data_validation_rule(spreadsheet, sheet, indices["vt"], final_row_count, dropdown_vt_rule, "Variante Terciaria")
     apply_cell_format(spreadsheet, sheet, indices["vp"], final_row_count, vp_cell_format, "Variante Primaria (Formato)")
 
-    if not batch_updates and not rows_to_append: print("\n🤷 No se necesitaron cambios. La hoja ya está sincronizada.")
+    if not batch_updates and not rows_to_append and not variants_to_zero_out:
+        print("\n🤷 No se necesitaron cambios. La hoja ya está sincronizada.")
+    else:
+        print("\n✅ Sincronización completada.")
+
 
 if __name__ == "__main__":
     main()
