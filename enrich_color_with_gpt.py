@@ -8,8 +8,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 MODEL = "gpt-4o-mini"
-INPUT_FILE = "products_with_color.json"
-OUTPUT_FILE = "products_with_color_gpt.json"
+INPUT_FILE = "products_without_color.json"
+OUTPUT_FILE = "products_without_color.json"
 
 # Inicializa cliente OpenAI
 try:

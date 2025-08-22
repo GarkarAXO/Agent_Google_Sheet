@@ -1,8 +1,10 @@
 import gspread
+import time
 import json
 import re
 from collections import defaultdict
 from oauth2client.service_account import ServiceAccountCredentials
+from thefuzz import process
 
 # === CONFIGURATION ===
 SPREADSHEET_ID = '1aX1yUvj2kJFv331P9P2xgzdVwD2Miadb47wEJVMI4TQ'
@@ -110,6 +112,63 @@ def update_aux_sheet(spreadsheet, aux_sheet_name, local_variant_summary):
     data_to_write = [headers] + list(zip(vp_list + [''] * (max_len - len(vp_list)), vs_list + [''] * (max_len - len(vs_list)), vt_list + [''] * (max_len - len(vt_list))))
     aux_sheet.update(values=data_to_write, range_name='E1', value_input_option='USER_ENTERED')
     print(f"✅ Hoja '{aux_sheet_name}' actualizada.")
+    return vp_options, vs_options, vt_options
+
+def normalize_variant_columns(sheet, rows, indices, vp_options, vs_options, vt_options):
+    print("🧼 Normalizando columnas de variantes...")
+    updates_to_normalize = []
+    
+    vp_options_list = list(vp_options)
+    vs_options_list = list(vs_options)
+    vt_options_list = list(vt_options)
+
+    for i, row in enumerate(rows, start=3):
+        try:
+            # Normalize Variante Primaria
+            vp_val = row[indices["vp"]].strip()
+            if vp_val and vp_val not in vp_options:
+                best_match, score = process.extractOne(vp_val, vp_options_list)
+                if score > 85:
+                    updates_to_normalize.append({
+                        'range': f'{col_to_letter(indices["vp"])}{i}',
+                        'values': [[best_match]]
+                    })
+                    print(f"  -> Corrigiendo VP en fila {i}: '{vp_val}' -> '{best_match}'")
+
+            # Normalize Variante Secundaria
+            vs_val = row[indices["vs"]].strip()
+            if vs_val and vs_val not in vs_options:
+                best_match, score = process.extractOne(vs_val, vs_options_list)
+                if score > 85:
+                    updates_to_normalize.append({
+                        'range': f'{col_to_letter(indices["vs"])}{i}',
+                        'values': [[best_match]]
+                    })
+                    print(f"  -> Corrigiendo VS en fila {i}: '{vs_val}' -> '{best_match}'")
+
+            # Normalize Variante Terciaria
+            vt_val = row[indices["vt"]].strip()
+            if vt_val and vt_val not in vt_options:
+                best_match, score = process.extractOne(vt_val, vt_options_list)
+                if score > 85:
+                    updates_to_normalize.append({
+                        'range': f'{col_to_letter(indices["vt"])}{i}',
+                        'values': [[best_match]]
+                    })
+                    print(f"  -> Corrigiendo VT en fila {i}: '{vt_val}' -> '{best_match}'")
+        except IndexError:
+            continue
+
+    if updates_to_normalize:
+        print(f"-> Se encontraron {len(updates_to_normalize)} celdas para normalizar. Actualizando...")
+        sheet.batch_update(updates_to_normalize, value_input_option='USER_ENTERED')
+        print("✅ Normalización completada.")
+        # Re-read the data from the sheet to have the normalized values
+        time.sleep(2) # Give a moment for the updates to propagate
+        return sheet.get_all_values()[2:]
+    else:
+        print("-> No se encontraron valores para normalizar.")
+        return rows
 
 def apply_data_validation_rule(spreadsheet, sheet, column_index, end_row, rule_dict, column_name):
     print(f"🎨 Aplicando regla de validación a la columna '{column_name}'...")
@@ -206,6 +265,24 @@ def map_sheet_variants(rows, headers, indices):
     print(f"-> Se mapearon {len(sheet_variants)} variantes de la hoja de Google.")
     return sheet_variants
 
+def insert_row_with_retry(sheet, data, index, max_retries=5, initial_backoff=1):
+    retries = 0
+    backoff = initial_backoff
+    while retries < max_retries:
+        try:
+            sheet.insert_row(data, index, value_input_option='USER_ENTERED')
+            print(f"   -> Insertada fila en la línea {index}")
+            return # Success
+        except gspread.exceptions.APIError as e:
+            if e.response.status_code == 429:
+                print(f"   -> Cuota excedida. Reintentando en {backoff} segundos...")
+                time.sleep(backoff)
+                backoff *= 2 # Exponential backoff
+                retries += 1
+            else:
+                raise # Re-raise other API errors
+    print(f"   -> Falló la inserción de la fila en la línea {index} después de {max_retries} reintentos.")
+
 def main():
     client = authenticate_gspread()
     spreadsheet = client.open_by_key(SPREADSHEET_ID)
@@ -243,6 +320,10 @@ def main():
     clean_column_brackets(sheet, indices["vp"])
     rows = sheet.get_all_values()[2:] if len(sheet.get_all_values()) > 2 else []
 
+    # --- Get all existing models from the sheet ---
+    existing_models = set(row[indices["model"]].strip().lower() for row in rows if len(row) > indices["model"] and row[indices["model"]].strip())
+    print(f"🔍 Se encontraron {len(existing_models)} modelos únicos en la hoja.")
+
     # --- NEW: Pre-process to find models marked as 'Principal' ---
     principal_models = set()
     print("🔍 Identificando modelos 'Principales' en la hoja...")
@@ -256,19 +337,26 @@ def main():
     # ---------------------------------------------------------
 
     local_variant_summary = load_local_variant_summary(VARIANT_SUMMARY_JSON_PATH)
-    update_aux_sheet(spreadsheet, AUX_SHEET_NAME, local_variant_summary)
+    vp_options, vs_options, vt_options = update_aux_sheet(spreadsheet, AUX_SHEET_NAME, local_variant_summary)
+    rows = normalize_variant_columns(sheet, rows, indices, vp_options, vs_options, vt_options)
 
     sheet_variants_map = map_sheet_variants(rows, headers, indices)
     local_variants_map = {}
 
-    batch_updates, rows_to_append = [], []
+    batch_updates = []
+    variants_to_insert = []
+    
     print("\n🔄 Sincronizando el resumen de stock local con la hoja de Google...")
 
     for variant in local_variant_summary:
         model_original = variant.get("model_original", "")
 
-        # --- NEW: 'Principal' Filter Logic ---
+        # --- 'Principal' Filter Logic ---
         if model_original not in principal_models:
+            continue
+        
+        # --- NEW: Check if model exists in sheet ---
+        if model_original.lower() not in existing_models:
             continue
         # ------------------------------------
 
@@ -284,9 +372,7 @@ def main():
             key = f"{model_original.lower()}::{storage.lower()}::{color.lower()}::{compania.lower()}"
             variant_details_for_new_row = {"model": model_original, "familia": familia, "vp": storage, "vs": color, "vt": compania}
         elif "CONSOLAS" in familia:
-            # Key for consoles includes model, storage (vp), caja (vs), and color (from the 'color' field in the variant)
             key = f"{model_original.lower()}::{storage.lower()}::{caja.lower()}::{color.lower()}"
-            # For new rows, vp is storage, vs is caja, vt is empty, and 'Color' column is populated with variant['color']
             variant_details_for_new_row = {"model": model_original, "familia": familia, "vp": storage, "vs": caja, "vt": "", "color_col": color}
         
         if not key: continue
@@ -297,20 +383,36 @@ def main():
             row_index = sheet_variants_map[key]
             batch_updates.append({'range': f'{inventory_col_letter}{row_index}', 'values': [[variant["stock"]]]})
         else:
+            # --- VALIDATION: Ensure essential fields are not empty ---
+            is_valid = False
+            if "CELULARES" in familia:
+                if model_original and storage and color and compania:
+                    is_valid = True
+            elif "CONSOLAS" in familia:
+                if model_original and storage and caja and color:
+                    is_valid = True
+            
+            if not is_valid:
+                print(f"⚠️ Variante de '{model_original}' omitida por tener datos incompletos.")
+                continue
+            # ---------------------------------------------------------
+
+            # --- NEW: Logic to insert variants of existing models ---
             new_row = [''] * len(headers)
             for col_name, index in indices.items():
                 if col_name in variant_details_for_new_row:
                     new_row[index] = variant_details_for_new_row[col_name]
                 elif col_name == "inventory":
                     new_row[index] = variant["stock"]
-                elif col_name == "color_col" and "color_col" in variant_details_for_new_row: # Handle color_col specifically
+                elif col_name == "color_col" and "color_col" in variant_details_for_new_row:
                     new_row[index] = variant_details_for_new_row["color_col"]
-            # Set default values for boolean-like columns for new rows
+            
             new_row[indices["cert"]] = "FALSE"
             new_row[indices["pub_exitosa"]] = "FALSE"
             new_row[indices["tiene_ventas"]] = "FALSE"
-            new_row[indices["principal_extra"]] = "Extra"
-            rows_to_append.append(new_row)
+            new_row[indices["principal_extra"]] = "Principal"
+            variants_to_insert.append({'model': model_original, 'row_data': new_row})
+            # ---------------------------------------------------------
 
     variants_to_zero_out = set(sheet_variants_map.keys()) - set(local_variants_map.keys())
     if variants_to_zero_out:
@@ -323,13 +425,36 @@ def main():
         print(f"-> Actualizando {len(batch_updates)} filas existentes...")
         sheet.batch_update(batch_updates)
     
-    if rows_to_append:
-        print(f"-> Añadiendo {len(rows_to_append)} nuevas filas...")
-        sheet.append_rows(rows_to_append, value_input_option='USER_ENTERED')
-        # FIX: Use the actual column count for the sort range to avoid issues with columns beyond Z
-        last_col_letter = col_to_letter(sheet.col_count - 1)
-        print(f"-> Ordenando hasta la columna {last_col_letter}...")
-        sheet.sort((indices["model"] + 1, 'asc'), range=f'A3:{last_col_letter}{sheet.row_count}')
+    # --- NEW: Intelligent insertion logic ---
+    if variants_to_insert:
+        print(f"-> Insertando {len(variants_to_insert)} nuevas variantes de modelos existentes...")
+        # Get a fresh copy of the sheet's models column
+        all_sheet_models = sheet.col_values(indices["model"] + 1)
+        
+        insertions = []
+        for item in variants_to_insert:
+            model_to_find = item['model']
+            # Find the last row for this model
+            last_row_index = -1
+            for i in range(len(all_sheet_models) - 1, -1, -1):
+                if all_sheet_models[i].strip().lower() == model_to_find.lower():
+                    last_row_index = i + 1 # 1-based index
+                    break
+            
+            if last_row_index != -1:
+                # We insert after this row
+                insertions.append({'insert_at': last_row_index + 1, 'data': item['row_data']})
+            else:
+                # Should not happen based on the logic above, but as a fallback, append
+                insertions.append({'insert_at': len(all_sheet_models) + 1, 'data': item['row_data']})
+
+        # Sort insertions by row index in descending order to not mess up indices
+        insertions.sort(key=lambda x: x['insert_at'], reverse=True)
+
+        for insertion in insertions:
+            insert_row_with_retry(sheet, insertion['data'], insertion['insert_at'])
+            time.sleep(1) # Keep a small delay to be respectful to the API
+    # ------------------------------------
 
     # --- Final Formatting Calls ---
     final_row_count = len(sheet.get_all_values())
@@ -361,10 +486,11 @@ def main():
     apply_data_validation_rule(spreadsheet, sheet, indices["vt"], final_row_count, dropdown_vt_rule, "Variante Terciaria")
     apply_cell_format(spreadsheet, sheet, indices["vp"], final_row_count, vp_cell_format, "Variante Primaria (Formato)")
 
-    if not batch_updates and not rows_to_append and not variants_to_zero_out:
+    if not batch_updates and not variants_to_insert and not variants_to_zero_out:
         print("\n🤷 No se necesitaron cambios. La hoja ya está sincronizada.")
     else:
         print("\n✅ Sincronización completada.")
+
 
 
 if __name__ == "__main__":

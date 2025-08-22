@@ -1,6 +1,6 @@
 import json
 
-BASE_FILE = "products_with_color.json"
+BASE_FILE = "products_enriched.json"
 UPDATED_FILE = "products_without_color.json"
 OUTPUT_FILE = "products_with_color_merged.json"
 
